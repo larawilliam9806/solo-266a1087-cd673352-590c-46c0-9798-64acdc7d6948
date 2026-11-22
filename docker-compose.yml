@@ -10,6 +10,19 @@ services:
     volumes:
       - strata-data:/data
     restart: unless-stopped
+    healthcheck:
+      # slim 镜像没有 curl，用标准库探活
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   strata-data:

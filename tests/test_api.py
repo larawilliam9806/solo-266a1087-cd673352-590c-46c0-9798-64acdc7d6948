@@ -310,3 +310,191 @@ def test_concurrent_batches_on_disjoint_groups(client):
         for r in client.get("/records", params={"active_only": True}).json()
     }
     assert active == {"R1", "R2", "R3", "R4"}
+
+
+def test_retract_middle_record_keeps_whole_rest_of_group(client):
+    """撤回组中间一条记录，组内其余层位和边必须完整保留（不能丢远端半边组）。"""
+    _register(client, "L1", "L2", "L3", "L4", "L5", "L6")
+    _batch(client, [
+        {"op": "add", "record_no": "R1", "before": "L1", "after": "L2"},
+        {"op": "add", "record_no": "R2", "before": "L2", "after": "L3"},
+        {"op": "add", "record_no": "R3", "before": "L3", "after": "L4"},
+        {"op": "add", "record_no": "R4", "before": "L4", "after": "L5"},
+        {"op": "add", "record_no": "R5", "before": "L5", "after": "L6"},
+    ])
+    result = _batch(client, [{"op": "retract", "record_no": "R2"}])
+    affected = {
+        tuple(g["strata"]): g["edges"] for g in result["affected_groups"]
+    }
+    assert set(affected) == {("L1", "L2"), ("L3", "L4", "L5", "L6")}
+    remote = affected[("L3", "L4", "L5", "L6")]
+    assert {
+        (e["before"], e["after"], tuple(e["record_numbers"])) for e in remote
+    } == {
+        ("L3", "L4", ("R3",)),
+        ("L4", "L5", ("R4",)),
+        ("L5", "L6", ("R5",)),
+    }
+    # 查询端也能读到完整的 L6 所在组
+    assert _group(client, "L6")["strata"] == ["L3", "L4", "L5", "L6"]
+
+
+def test_correct_moves_record_between_groups_with_full_support(client):
+    _register(client, "L1", "L2", "L3", "L4", "L5")
+    _batch(client, [
+        {"op": "add", "record_no": "R1", "before": "L1", "after": "L2"},
+        {"op": "add", "record_no": "R2", "before": "L1", "after": "L2"},
+        {"op": "add", "record_no": "R3", "before": "L4", "after": "L5"},
+    ])
+    # 把一组中的一条记录改到另一组，并把两组各撕开一部分
+    result = _batch(client, [
+        {"op": "correct", "record_no": "R1", "before": "L2", "after": "L4"},
+    ])
+    affected = {
+        tuple(g["strata"]): {
+            (e["before"], e["after"]): e["record_numbers"]
+            for e in g["edges"]
+        }
+        for g in result["affected_groups"]
+    }
+    assert set(affected) == {("L1", "L2", "L4", "L5")}
+    edges = affected[("L1", "L2", "L4", "L5")]
+    # L2->L4 桥接两组；R2 仍支撑 L1->L2，R3 仍支撑 L4->L5
+    assert edges == {
+        ("L2", "L4"): ["R1"],
+        ("L1", "L2"): ["R2"],
+        ("L4", "L5"): ["R3"],
+    }
+    assert _group(client, "L5")["strata"] == ["L1", "L2", "L4", "L5"]
+
+
+def test_concurrent_opposite_batches_cannot_both_commit(client, monkeypatch):
+    """两批并发补录，任一批先提交成功，另一批必须在写锁内复核并驳回成环。"""
+    from app import service
+    from app.schemas import BatchRequest
+
+    _register(client, "L1", "L2")
+    barrier = threading.Barrier(2)
+    local = threading.local()
+    original_plan = service._plan
+
+    def synchronized_plan(state, operations):
+        # 让两批都完成锁外规划后，再一起去抢写锁，制造已知的“旧快照”竞争
+        if not getattr(local, "waited", False):
+            local.waited = True
+            barrier.wait(timeout=10)
+        return original_plan(state, operations)
+
+    monkeypatch.setattr(service, "_plan", synchronized_plan)
+
+    outcomes: list[tuple[str, str]] = []
+    lock = threading.Lock()
+
+    def worker(record_no, before, after):
+        try:
+            service.apply_batch(BatchRequest(operations=[{
+                "op": "add", "record_no": record_no,
+                "before": before, "after": after,
+            }]))
+            outcome = "committed"
+        except service.CycleConflict:
+            outcome = "rejected"
+        with lock:
+            outcomes.append((record_no, outcome))
+
+    threads = [
+        threading.Thread(target=worker, args=("R1", "L1", "L2")),
+        threading.Thread(target=worker, args=("R2", "L2", "L1")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcome for _, outcome in outcomes) == ["committed", "rejected"]
+    # 库内只留下一条记录，图无环
+    groups = client.get("/groups").json()
+    assert len(groups) == 1
+    assert len(groups[0]["edges"]) == 1
+    active = client.get("/records", params={"active_only": True}).json()
+    assert len(active) == 1
+
+
+def test_save_failure_rolls_back_records_and_graph(client, monkeypatch):
+    from app import service
+    from app.schemas import BatchRequest
+
+    _register(client, "L1", "L2")
+    _batch(client, [
+        {"op": "add", "record_no": "R1", "before": "L1", "after": "L2"},
+    ])
+    before_group = _group(client, "L1")
+
+    original_persist = service._persist
+
+    def persist_then_fail(conn, plan, operations, now):
+        original_persist(conn, plan, operations, now)
+        raise RuntimeError("simulated disk failure")
+
+    monkeypatch.setattr(service, "_persist", persist_then_fail)
+    with pytest.raises(RuntimeError):
+        service.apply_batch(BatchRequest(operations=[
+            {"op": "add", "record_no": "R2", "before": "L1", "after": "L2"},
+        ]))
+    # 只还原 _persist，不能 undo 掉 client fixture 设置的 ARCH_DB_PATH
+    monkeypatch.setattr(service, "_persist", original_persist)
+
+    # 新记录与重算后的图都没有生效，原记录与原图保持原状
+    assert {r["record_no"] for r in client.get("/records").json()} == {"R1"}
+    assert _group(client, "L1") == before_group
+
+
+def test_recompute_does_not_block_queries_or_other_groups(client, monkeypatch):
+    """重算不持写锁：图计算进行中，查询与其他组的订正都能完成。"""
+    from app import graph, service
+    from app.schemas import BatchRequest
+
+    _register(client, "L1", "L2", "L3", "L4", "L5", "L6")
+    _batch(client, [
+        {"op": "add", "record_no": "R1", "before": "L1", "after": "L2"},
+        {"op": "add", "record_no": "R2", "before": "L4", "after": "L5"},
+    ])
+    big_batch = BatchRequest(operations=[
+        {"op": "add", "record_no": f"X{i}", "before": "L1", "after": "L2"}
+        for i in range(3)
+    ])
+
+    entered = threading.Event()
+    release = threading.Event()
+    original = graph.transitive_reduction
+
+    def paused_reduction(vertices, adjacency):
+        if "L1" in vertices:
+            entered.set()
+            assert release.wait(timeout=10), "其他组订正未能完成"
+        return original(vertices, adjacency)
+
+    monkeypatch.setattr(graph, "transitive_reduction", paused_reduction)
+    recompute = threading.Thread(
+        target=service.apply_batch, args=(big_batch,), daemon=True
+    )
+    recompute.start()
+    assert entered.wait(timeout=10)
+
+    # 重算挂起期间：查询接口读到的是已生效的图
+    group = _group(client, "L4")
+    assert group["strata"] == ["L4", "L5"]
+    # 无关层位组可以正常订正并提交
+    other = _batch(client, [
+        {"op": "add", "record_no": "R3", "before": "L5", "after": "L6"},
+    ])
+    assert other["affected_groups"][0]["strata"] == ["L4", "L5", "L6"]
+
+    release.set()
+    recompute.join(timeout=10)
+    assert not recompute.is_alive()
+    # 大组的本批记录也已生效，且图仍为最简两条边
+    assert {
+        (e["before"], e["after"]) for e in _group(client, "L1")["edges"]
+    } == {("L1", "L2")}
+    assert _group(client, "L6")["strata"] == ["L4", "L5", "L6"]

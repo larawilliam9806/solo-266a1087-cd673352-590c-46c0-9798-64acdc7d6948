@@ -5,6 +5,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from collections.abc import Iterator
+from pathlib import Path
 
 DEFAULT_DB_PATH = os.environ.get("ARCH_DB_PATH", "/data/archaeology.db")
 
@@ -62,7 +63,11 @@ def get_db_path() -> str:
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     """打开一个手动事务（isolation_level=None）的连接。"""
-    conn = sqlite3.connect(db_path or get_db_path(), check_same_thread=False)
+    path = db_path or get_db_path()
+    # 仅对文件型库创建父目录；":memory:" 等特殊路径跳过
+    if path != ":memory:":
+        Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
