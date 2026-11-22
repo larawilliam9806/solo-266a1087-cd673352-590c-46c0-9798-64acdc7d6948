@@ -1,0 +1,15 @@
+services:
+  archaeology-api:
+    build: .
+    image: archaeology-strata-api:latest
+    container_name: archaeology-strata-api
+    ports:
+      - "8000:8000"
+    environment:
+      ARCH_DB_PATH: /data/archaeology.db
+    volumes:
+      - strata-data:/data
+    restart: unless-stopped
+
+volumes:
+  strata-data:
